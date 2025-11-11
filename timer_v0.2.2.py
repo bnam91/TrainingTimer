@@ -20,8 +20,27 @@ import termios
 class TerminalTimer:
     def __init__(self):
         self.is_running = False
+        # ANSI 색상 코드 (가장 먼저 초기화하여 참조 오류 방지)
+        self.COLORS = {
+            'GREEN': '\033[92m',
+            'RED': '\033[91m',
+            'YELLOW': '\033[93m',
+            'BLUE': '\033[94m',
+            'MAGENTA': '\033[95m',
+            'CYAN': '\033[96m',
+            'WHITE': '\033[97m',
+            'BOLD': '\033[1m',
+            'RESET': '\033[0m'
+        }
         # pygame 초기화
-        pygame.mixer.init()
+        # macOS에서 오디오 드라이버를 명시적으로 설정 (필요시)
+        try:
+            if sys.platform == 'darwin' and not os.environ.get('SDL_AUDIODRIVER'):
+                os.environ['SDL_AUDIODRIVER'] = 'coreaudio'
+        except Exception:
+            pass
+        # mixer 초기화 옵션 명시
+        pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
         
         # readline 초기화 (한글 입력 개선)
         try:
@@ -51,29 +70,27 @@ class TerminalTimer:
         # 현재 업무 텍스트
         self.current_task = ""
         
+        # 경로 관련 변수
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.voice_dir = os.path.join(self.base_dir, "voice")
+        
         # 로그 관련 변수
         self.log_dir = "logs"
         self.log_file = os.path.join(self.log_dir, "timer_log.json")
         self._ensure_log_directory()
+
+    def _voice_path(self, filename):
+        """voice 디렉토리의 절대 경로를 반환합니다."""
+        return os.path.join(self.voice_dir, filename)
         
-        # ANSI 색상 코드
-        self.COLORS = {
-            'GREEN': '\033[92m',
-            'RED': '\033[91m',
-            'YELLOW': '\033[93m',
-            'BLUE': '\033[94m',
-            'MAGENTA': '\033[95m',
-            'CYAN': '\033[96m',
-            'WHITE': '\033[97m',
-            'BOLD': '\033[1m',
-            'RESET': '\033[0m'
-        }
+        
         
     def play_sound(self, sound_file):
         """MP3 파일을 재생합니다."""
         try:
-            if os.path.exists(sound_file):
-                pygame.mixer.music.load(sound_file)
+            absolute_path = sound_file if os.path.isabs(sound_file) else self._voice_path(os.path.basename(sound_file))
+            if os.path.exists(absolute_path):
+                pygame.mixer.music.load(absolute_path)
                 pygame.mixer.music.play()
                 # 재생이 완료될 때까지 대기
                 while pygame.mixer.music.get_busy():
@@ -86,8 +103,9 @@ class TerminalTimer:
     def play_beep(self):
         """비프음을 재생합니다 (비동기적으로)."""
         try:
-            if os.path.exists("voice/비프음.mp3"):
-                pygame.mixer.music.load("voice/비프음.mp3")
+            beep_path = self._voice_path("비프음.mp3")
+            if os.path.exists(beep_path):
+                pygame.mixer.music.load(beep_path)
                 pygame.mixer.music.play()
         except Exception as e:
             print(f"비프음 재생 중 오류가 발생했습니다: {e}")
@@ -183,9 +201,9 @@ class TerminalTimer:
                         break
                 
                 # 5분마다 알림 재생 (2번 반복)
-                if os.path.exists("voice/타이머를다시설정해.mp3"):
+                if os.path.exists(self._voice_path("타이머를다시설정해.mp3")):
                     try:
-                        pygame.mixer.music.load("voice/타이머를다시설정해.mp3")
+                        pygame.mixer.music.load(self._voice_path("타이머를다시설정해.mp3"))
                         pygame.mixer.music.play()
                         # 재생 완료 대기
                         while pygame.mixer.music.get_busy():
@@ -219,36 +237,36 @@ class TerminalTimer:
             if remaining_seconds == half_time:
                 # 다른 알림과 겹치는지 확인
                 if not self.is_overlapping_with_other_notifications(remaining_seconds):
-                    if os.path.exists("voice/종료50%전.mp3"):
-                        pygame.mixer.music.load("voice/종료50%전.mp3")
+                    if os.path.exists(self._voice_path("종료50%전.mp3")):
+                        pygame.mixer.music.load(self._voice_path("종료50%전.mp3"))
                         pygame.mixer.music.play()
                         return
             
             # 15분 전 알림 (30분 이상 타이머에서만)
             if remaining_seconds == 15 * 60 and total_seconds >= 30 * 60:
-                if os.path.exists("voice/종료15분전.mp3"):
-                    pygame.mixer.music.load("voice/종료15분전.mp3")
+                if os.path.exists(self._voice_path("종료15분전.mp3")):
+                    pygame.mixer.music.load(self._voice_path("종료15분전.mp3"))
                     pygame.mixer.music.play()
                     return
             
             # 10분 전 알림
             if remaining_seconds == 10 * 60:
-                if os.path.exists("voice/종료10분전.mp3"):
-                    pygame.mixer.music.load("voice/종료10분전.mp3")
+                if os.path.exists(self._voice_path("종료10분전.mp3")):
+                    pygame.mixer.music.load(self._voice_path("종료10분전.mp3"))
                     pygame.mixer.music.play()
                     return
             
             # 5분 전 알림
             if remaining_seconds == 5 * 60:
-                if os.path.exists("voice/종료5분전.mp3"):
-                    pygame.mixer.music.load("voice/종료5분전.mp3")
+                if os.path.exists(self._voice_path("종료5분전.mp3")):
+                    pygame.mixer.music.load(self._voice_path("종료5분전.mp3"))
                     pygame.mixer.music.play()
                     return
             
             # 3분 전 알림 (2번 반복)
             if remaining_seconds == 3 * 60:
-                if os.path.exists("voice/종료3분전.mp3"):
-                    pygame.mixer.music.load("voice/종료3분전.mp3")
+                if os.path.exists(self._voice_path("종료3분전.mp3")):
+                    pygame.mixer.music.load(self._voice_path("종료3분전.mp3"))
                     pygame.mixer.music.play()
                     # 재생 완료 후 2번째 재생
                     while pygame.mixer.music.get_busy():
@@ -258,8 +276,8 @@ class TerminalTimer:
             
             # 1분 전 알림 (2번 반복)
             if remaining_seconds == 1 * 60:
-                if os.path.exists("voice/종료1분전.mp3"):
-                    pygame.mixer.music.load("voice/종료1분전.mp3")
+                if os.path.exists(self._voice_path("종료1분전.mp3")):
+                    pygame.mixer.music.load(self._voice_path("종료1분전.mp3"))
                     pygame.mixer.music.play()
                     # 재생 완료 후 2번째 재생
                     while pygame.mixer.music.get_busy():
@@ -269,15 +287,15 @@ class TerminalTimer:
             
             # 30초 전 알림
             if remaining_seconds == 30:
-                if os.path.exists("voice/종료30초전.mp3"):
-                    pygame.mixer.music.load("voice/종료30초전.mp3")
+                if os.path.exists(self._voice_path("종료30초전.mp3")):
+                    pygame.mixer.music.load(self._voice_path("종료30초전.mp3"))
                     pygame.mixer.music.play()
                     return
             
             # 10초 전 알림
             if remaining_seconds == 10:
-                if os.path.exists("voice/종료10초전.mp3"):
-                    pygame.mixer.music.load("voice/종료10초전.mp3")
+                if os.path.exists(self._voice_path("종료10초전.mp3")):
+                    pygame.mixer.music.load(self._voice_path("종료10초전.mp3"))
                     pygame.mixer.music.play()
                     return
                     
@@ -487,7 +505,7 @@ class TerminalTimer:
                 sys.stdout.flush()
                 
                 # 완료 알림음 재생
-                sound_file = "voice/타이머종료.mp3"
+                sound_file = self._voice_path("타이머종료.mp3")
                 print("🔊 완료 알림음을 재생합니다...")
                 sys.stdout.flush()
                 self.play_sound(sound_file)
