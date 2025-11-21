@@ -1,0 +1,938 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+터미널 타이머 프로그램
+실시간 카운트다운을 터미널에서 보여줍니다.
+"""
+
+import time
+import sys
+import os
+from datetime import datetime, timedelta
+import pygame
+import threading
+import json
+import readline
+import select
+import tty
+import termios
+
+class TerminalTimer:
+    def __init__(self):
+        self.is_running = False
+        # ANSI 색상 코드 (가장 먼저 초기화하여 참조 오류 방지)
+        self.COLORS = {
+            'GREEN': '\033[92m',
+            'RED': '\033[91m',
+            'YELLOW': '\033[93m',
+            'BLUE': '\033[94m',
+            'MAGENTA': '\033[95m',
+            'CYAN': '\033[96m',
+            'WHITE': '\033[97m',
+            'BOLD': '\033[1m',
+            'RESET': '\033[0m'
+        }
+        # pygame 초기화
+        # macOS에서 오디오 드라이버를 명시적으로 설정 (필요시)
+        try:
+            if sys.platform == 'darwin' and not os.environ.get('SDL_AUDIODRIVER'):
+                os.environ['SDL_AUDIODRIVER'] = 'coreaudio'
+        except Exception:
+            pass
+        # mixer 초기화 옵션 명시
+        pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
+        
+        # readline 초기화 (한글 입력 개선)
+        try:
+            # readline이 사용 가능한 경우 설정
+            if hasattr(readline, 'parse_and_bind'):
+                # 한글 입력을 위한 기본 설정
+                readline.parse_and_bind('tab: complete')
+                # macOS에서 한글 입력 문제 해결을 위한 설정
+                if sys.platform == 'darwin':
+                    # macOS에서 readline이 제대로 작동하도록 설정
+                    pass
+        except (ImportError, AttributeError):
+            # readline을 사용할 수 없는 경우 무시
+            pass
+        
+        # 타이머 완료 후 알림 관련 변수
+        self.reminder_active = False
+        self.timer_completed_time = None
+        self.reminder_thread = None
+        self.reminder_lock = threading.Lock()
+        
+        # 일시정지 관련 변수
+        self.is_paused = False
+        self.pause_lock = threading.Lock()
+        self.old_settings = None
+        
+        # 현재 업무 텍스트
+        self.current_task = ""
+        
+        # 경로 관련 변수
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.voice_dir = os.path.join(self.base_dir, "voice")
+        
+        # 로그 관련 변수
+        self.log_dir = "logs"
+        self.log_file = os.path.join(self.log_dir, "timer_log.json")
+        self._ensure_log_directory()
+
+    def _voice_path(self, filename):
+        """voice 디렉토리의 절대 경로를 반환합니다."""
+        return os.path.join(self.voice_dir, filename)
+        
+        
+        
+    def play_sound(self, sound_file):
+        """MP3 파일을 재생합니다."""
+        try:
+            absolute_path = sound_file if os.path.isabs(sound_file) else self._voice_path(os.path.basename(sound_file))
+            if os.path.exists(absolute_path):
+                pygame.mixer.music.load(absolute_path)
+                pygame.mixer.music.play()
+                # 재생이 완료될 때까지 대기
+                while pygame.mixer.music.get_busy():
+                    time.sleep(0.1)
+            else:
+                print(f"소리 파일을 찾을 수 없습니다: {sound_file}")
+        except Exception as e:
+            print(f"소리 재생 중 오류가 발생했습니다: {e}")
+    
+    def play_beep(self):
+        """비프음을 재생합니다 (비동기적으로)."""
+        try:
+            beep_path = self._voice_path("비프음.mp3")
+            if os.path.exists(beep_path):
+                pygame.mixer.music.load(beep_path)
+                pygame.mixer.music.play()
+        except Exception as e:
+            print(f"비프음 재생 중 오류가 발생했습니다: {e}")
+    
+    def _ensure_log_directory(self):
+        """로그 디렉토리가 없으면 생성합니다."""
+        if not os.path.exists(self.log_dir):
+            os.makedirs(self.log_dir)
+    
+    def _load_logs(self):
+        """로그 파일을 로드합니다."""
+        if os.path.exists(self.log_file):
+            try:
+                with open(self.log_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                return []
+        return []
+    
+    def _save_logs(self, logs):
+        """로그를 파일에 저장합니다."""
+        try:
+            with open(self.log_file, 'w', encoding='utf-8') as f:
+                json.dump(logs, f, ensure_ascii=False, indent=2)
+        except IOError as e:
+            print(f"로그 저장 중 오류가 발생했습니다: {e}")
+    
+    def _get_next_log_number(self):
+        """다음 로그 번호를 가져옵니다."""
+        logs = self._load_logs()
+        if not logs:
+            return 1
+        return max(log.get('number', 0) for log in logs) + 1
+    
+    def log_timer_start(self, total_seconds, task_description="", reward_info=None):
+        """타이머 시작 로그를 기록합니다."""
+        logs = self._load_logs()
+        log_number = self._get_next_log_number()
+        
+        now = datetime.now()
+        log_entry = {
+            'number': log_number,
+            'date': now.strftime('%Y년 %m월 %d일'),
+            'time': now.strftime('%H시 %M분 %S초'),
+            'datetime': now.isoformat(),
+            'timer_duration': total_seconds,
+            'timer_duration_formatted': self.format_time(total_seconds),
+            'task': task_description if task_description else "(업무 없음)",
+            'status': '시작',
+            'completed': False
+        }
+        # 보상 정보 기록
+        if reward_info and isinstance(reward_info, dict):
+            log_entry['reward'] = {
+                'enabled': True,
+                'description': reward_info.get('description', ''),
+                'duration_seconds': reward_info.get('seconds', 0)
+            }
+        else:
+            log_entry['reward'] = {
+                'enabled': False
+            }
+        
+        logs.append(log_entry)
+        self._save_logs(logs)
+        return log_number
+    
+    def log_timer_complete(self, log_number, task_success=None, reward_executed=None):
+        """타이머 완료 로그를 업데이트합니다."""
+        logs = self._load_logs()
+        for log in logs:
+            if log.get('number') == log_number:
+                log['status'] = '완료'
+                log['completed'] = True
+                log['completed_datetime'] = datetime.now().isoformat()
+                if task_success is not None:
+                    log['task_success'] = bool(task_success)
+                if reward_executed is not None:
+                    log['reward_executed'] = bool(reward_executed)
+                break
+        self._save_logs(logs)
+    
+    def log_timer_stop(self, log_number, remaining_seconds):
+        """타이머 중지 로그를 업데이트합니다."""
+        logs = self._load_logs()
+        for log in logs:
+            if log.get('number') == log_number:
+                log['status'] = '중지'
+                log['completed'] = False
+                log['remaining_seconds'] = remaining_seconds
+                log['stopped_datetime'] = datetime.now().isoformat()
+                break
+        self._save_logs(logs)
+    
+    def run_reward_timer(self, reward_seconds, reward_description="", log_number=None):
+        """보상 타이머를 실행합니다. 추가 음성 알림 포함."""
+        remaining = int(reward_seconds)
+        try:
+            while remaining > 0:
+                # 보상 타이틀을 task_description 자리에 표시
+                desc_for_display = f"[보상] {reward_description}" if reward_description else "[보상]"
+                self.display_timer(remaining, reward_seconds, desc_for_display)
+                # 시간대별 알림 재사용
+                self.play_time_notification(remaining, reward_seconds)
+                # 막판 5초 비프
+                if remaining <= 5:
+                    self.play_beep()
+                time.sleep(1)
+                remaining -= 1
+            
+            # 완료 화면 및 소리
+            self.clear_screen()
+            print("=" * 60)
+            print("🎉 보상 타이머 완료!")
+            print("=" * 60)
+            if reward_description:
+                print(f"보상: {self.COLORS['CYAN']}{self.COLORS['BOLD']}{reward_description}{self.COLORS['RESET']}")
+            print(f"보상 시간 {self.COLORS['GREEN']}{self.COLORS['BOLD']}{self.format_time(reward_seconds)}{self.COLORS['RESET']}이 모두 경과했습니다.")
+            print("=" * 60)
+            sys.stdout.flush()
+            # 완료 알림음
+            try:
+                self.play_sound(self._voice_path("타이머종료.mp3"))
+            except Exception:
+                pass
+            # 로그 갱신
+            if log_number:
+                logs = self._load_logs()
+                for log in logs:
+                    if log.get('number') == log_number:
+                        log['reward_executed'] = True
+                        log['reward_completed_datetime'] = datetime.now().isoformat()
+                        break
+                self._save_logs(logs)
+            return True
+        except KeyboardInterrupt:
+            # 보상 타이머 중지
+            self.clear_screen()
+            print("=" * 60)
+            print("⏹️ 보상 타이머가 중지되었습니다.")
+            print("=" * 60)
+            sys.stdout.flush()
+            # 로그 갱신 (미완료 처리)
+            if log_number:
+                logs = self._load_logs()
+                for log in logs:
+                    if log.get('number') == log_number:
+                        log['reward_executed'] = False
+                        break
+                self._save_logs(logs)
+            return False
+
+    def start_reminder_thread(self):
+        """타이머 완료 후 3분마다 알림을 재생하는 스레드를 시작합니다."""
+        with self.reminder_lock:
+            self.reminder_active = True
+            self.timer_completed_time = time.time()
+        
+        def reminder_loop():
+            # 3분 대기
+            time.sleep(3 * 60)
+            
+            while True:
+                with self.reminder_lock:
+                    if not self.reminder_active:
+                        break
+                
+                # 3분마다 알림 재생 (2번 반복)
+                if os.path.exists(self._voice_path("타이머를다시설정해.mp3")):
+                    try:
+                        pygame.mixer.music.load(self._voice_path("타이머를다시설정해.mp3"))
+                        pygame.mixer.music.play()
+                        # 재생 완료 대기
+                        while pygame.mixer.music.get_busy():
+                            time.sleep(0.1)
+                        # 2번째 재생
+                        pygame.mixer.music.play()
+                        # 재생 완료 대기
+                        while pygame.mixer.music.get_busy():
+                            time.sleep(0.1)
+                    except Exception as e:
+                        print(f"알림 재생 중 오류가 발생했습니다: {e}")
+                
+                # 다음 알림까지 3분 대기
+                time.sleep(3 * 60)
+        
+        self.reminder_thread = threading.Thread(target=reminder_loop, daemon=True)
+        self.reminder_thread.start()
+    
+    def stop_reminder_thread(self):
+        """알림 스레드를 중지합니다."""
+        with self.reminder_lock:
+            self.reminder_active = False
+        if self.reminder_thread and self.reminder_thread.is_alive():
+            self.reminder_thread.join(timeout=1)
+    
+    def play_time_notification(self, remaining_seconds, total_seconds):
+        """남은 시간에 따라 알림음을 재생합니다."""
+        try:
+            # 50% 남았을 때 알림 (다른 알림과 겹치지 않을 때만)
+            half_time = total_seconds // 2
+            if remaining_seconds == half_time:
+                # 다른 알림과 겹치는지 확인
+                if not self.is_overlapping_with_other_notifications(remaining_seconds):
+                    if os.path.exists(self._voice_path("종료50%전.mp3")):
+                        pygame.mixer.music.load(self._voice_path("종료50%전.mp3"))
+                        pygame.mixer.music.play()
+                        return
+            
+            # 15분 전 알림 (30분 이상 타이머에서만)
+            if remaining_seconds == 15 * 60 and total_seconds >= 30 * 60:
+                if os.path.exists(self._voice_path("종료15분전.mp3")):
+                    pygame.mixer.music.load(self._voice_path("종료15분전.mp3"))
+                    pygame.mixer.music.play()
+                    return
+            
+            # 10분 전 알림
+            if remaining_seconds == 10 * 60:
+                if os.path.exists(self._voice_path("종료10분전.mp3")):
+                    pygame.mixer.music.load(self._voice_path("종료10분전.mp3"))
+                    pygame.mixer.music.play()
+                    return
+            
+            # 5분 전 알림
+            if remaining_seconds == 5 * 60:
+                if os.path.exists(self._voice_path("종료5분전.mp3")):
+                    pygame.mixer.music.load(self._voice_path("종료5분전.mp3"))
+                    pygame.mixer.music.play()
+                    return
+            
+            # 3분 전 알림 (2번 반복)
+            if remaining_seconds == 3 * 60:
+                if os.path.exists(self._voice_path("종료3분전.mp3")):
+                    pygame.mixer.music.load(self._voice_path("종료3분전.mp3"))
+                    pygame.mixer.music.play()
+                    # 재생 완료 후 2번째 재생
+                    while pygame.mixer.music.get_busy():
+                        time.sleep(0.1)
+                    pygame.mixer.music.play()
+                    return
+            
+            # 1분 전 알림 (2번 반복)
+            if remaining_seconds == 1 * 60:
+                if os.path.exists(self._voice_path("종료1분전.mp3")):
+                    pygame.mixer.music.load(self._voice_path("종료1분전.mp3"))
+                    pygame.mixer.music.play()
+                    # 재생 완료 후 2번째 재생
+                    while pygame.mixer.music.get_busy():
+                        time.sleep(0.1)
+                    pygame.mixer.music.play()
+                    return
+            
+            # 30초 전 알림
+            if remaining_seconds == 30:
+                if os.path.exists(self._voice_path("종료30초전.mp3")):
+                    pygame.mixer.music.load(self._voice_path("종료30초전.mp3"))
+                    pygame.mixer.music.play()
+                    return
+            
+            # 10초 전 알림
+            if remaining_seconds == 10:
+                if os.path.exists(self._voice_path("종료10초전.mp3")):
+                    pygame.mixer.music.load(self._voice_path("종료10초전.mp3"))
+                    pygame.mixer.music.play()
+                    return
+                    
+        except Exception as e:
+            print(f"알림음 재생 중 오류가 발생했습니다: {e}")
+    
+    def is_overlapping_with_other_notifications(self, remaining_seconds):
+        """다른 알림과 겹치는지 확인합니다."""
+        # 다른 알림 시간들과 겹치는지 확인
+        notification_times = [
+            15 * 60,  # 15분 전
+            10 * 60,  # 10분 전
+            5 * 60,   # 5분 전
+            3 * 60,   # 3분 전
+            1 * 60,   # 1분 전
+            30,       # 30초 전
+            10        # 10초 전
+        ]
+        
+        return remaining_seconds in notification_times
+    
+    def clear_screen(self):
+        """터미널 화면을 지웁니다."""
+        # ANSI escape sequence를 사용하여 화면 지우기 (더 안정적)
+        print('\033[2J\033[H', end='')
+        sys.stdout.flush()
+        
+    def format_time(self, seconds):
+        """초를 시:분:초 형식으로 변환합니다."""
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+        
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        else:
+            return f"{minutes:02d}:{secs:02d}"
+    
+    def create_progress_bar(self, current, total, width=50):
+        """진행률 바를 생성합니다."""
+        if total == 0:
+            return "█" * width
+        
+        progress = current / total
+        filled = int(width * progress)
+        bar = "█" * filled + "░" * (width - filled)
+        percentage = int(progress * 100)
+        
+        return f"[{bar}] {percentage:3d}%"
+    
+    def display_timer(self, remaining_seconds, total_seconds, task_description=""):
+        """타이머 화면을 표시합니다."""
+        self.clear_screen()
+        
+        # 현재 시간 
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # 남은 시간
+        time_str = self.format_time(remaining_seconds)
+        
+        # 진행률 바
+        progress_bar = self.create_progress_bar(total_seconds - remaining_seconds, total_seconds)
+        
+        # 화면 구성 (한 번에 출력하여 정렬 문제 방지)
+        output_lines = [
+            "=" * 60,
+            "⏰ 트레이닝 타이머",
+            "=" * 60,
+            f"현재 시간: {current_time}",
+            ""
+        ]
+        
+        # 업무 텍스트 표시
+        if task_description:
+            output_lines.append(f"📋 업무: {self.COLORS['CYAN']}{self.COLORS['BOLD']}{task_description}{self.COLORS['RESET']}")
+            output_lines.append("")
+        
+        output_lines.extend([
+            f"남은 시간: {self.COLORS['GREEN']}{self.COLORS['BOLD']}{time_str}{self.COLORS['RESET']}",
+            "",
+            f"진행률: {self.COLORS['GREEN']}{self.COLORS['BOLD']}{progress_bar}{self.COLORS['RESET']}",
+            ""
+        ])
+        
+        # 일시정지 상태 표시
+        with self.pause_lock:
+            is_paused = self.is_paused
+        
+        # 시간별 상태 메시지
+        if remaining_seconds > 0:
+            if is_paused:
+                output_lines.append(f"{self.COLORS['YELLOW']}{self.COLORS['BOLD']}⏸️  일시정지 중...{self.COLORS['RESET']}")
+            elif remaining_seconds <= 10:
+                output_lines.append("🔴 마지막 10초!")
+            elif remaining_seconds <= 30:
+                output_lines.append("🟡 마지막 30초!")
+            elif remaining_seconds <= 60:
+                output_lines.append("🟠 마지막 1분!")
+            else:
+                output_lines.append("🟢 타이머 진행 중...")
+        else:
+            output_lines.append("🎉 시간 완료!")
+        
+        output_lines.extend([
+            "=" * 60,
+            "Ctrl+C: 타이머 중지 | P: 일시정지/재개"
+        ])
+        
+        # 한 번에 출력
+        print("\n".join(output_lines))
+        sys.stdout.flush()
+    
+    def _check_keyboard_input(self):
+        """키보드 입력을 확인합니다 (non-blocking)."""
+        if sys.platform == 'win32':
+            # Windows는 다른 방식 필요
+            return None
+        
+        try:
+            if select.select([sys.stdin], [], [], 0)[0]:
+                # 한 글자 읽기 (이미 raw 모드이므로 바로 읽을 수 있음)
+                ch = sys.stdin.read(1)
+                return ch.lower()
+        except (OSError, ValueError, KeyboardInterrupt):
+            return None
+        return None
+    
+    def _toggle_pause(self):
+        """일시정지를 토글합니다."""
+        with self.pause_lock:
+            self.is_paused = not self.is_paused
+            if self.is_paused:
+                print(f"\n{self.COLORS['YELLOW']}⏸️  타이머가 일시정지되었습니다.{self.COLORS['RESET']}")
+            else:
+                print(f"\n{self.COLORS['GREEN']}▶️  타이머가 재개되었습니다.{self.COLORS['RESET']}")
+    
+    def countdown(self, total_seconds, task_description="", log_number=None, reward_info=None):
+        """카운트다운을 실행합니다."""
+        self.is_running = True
+        self.is_paused = False
+        remaining_seconds = total_seconds
+        
+        # 터미널을 raw 모드로 설정 (키보드 입력 감지를 위해)
+        try:
+            if sys.platform != 'win32':
+                self.old_settings = termios.tcgetattr(sys.stdin)
+                tty.setcbreak(sys.stdin.fileno())
+        except (termios.error, OSError):
+            pass
+        
+        try:
+            while remaining_seconds > 0 and self.is_running:
+                # 키보드 입력 확인
+                ch = self._check_keyboard_input()
+                if ch == 'p':
+                    self._toggle_pause()
+                    # 입력 후 화면 다시 표시
+                    self.display_timer(remaining_seconds, total_seconds, task_description)
+                
+                # 일시정지 상태 확인
+                with self.pause_lock:
+                    is_paused = self.is_paused
+                
+                # 일시정지 중이 아닐 때만 시간 감소
+                if not is_paused:
+                    self.display_timer(remaining_seconds, total_seconds, task_description)
+                    
+                    # 시간대별 알림음 재생
+                    self.play_time_notification(remaining_seconds, total_seconds)
+                    
+                    # 5초 남은 순간부터 비프음 재생
+                    if remaining_seconds <= 5:
+                        self.play_beep()
+                    
+                    time.sleep(1)
+                    remaining_seconds -= 1
+                else:
+                    # 일시정지 중에는 화면만 업데이트
+                    self.display_timer(remaining_seconds, total_seconds, task_description)
+                    time.sleep(0.1)  # CPU 사용량을 줄이기 위해 짧은 대기
+            
+            # 완료 화면
+            if self.is_running:
+                # 터미널 설정 복원 (출력이 정상적으로 보이도록)
+                try:
+                    if self.old_settings and sys.platform != 'win32':
+                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+                        self.old_settings = None
+                except (termios.error, OSError):
+                    pass
+                
+                # 출력 버퍼 비우기
+                sys.stdout.flush()
+                time.sleep(0.1)  # 터미널 설정 복원 후 짧은 대기
+                
+                self.clear_screen()
+                sys.stdout.flush()
+                
+                # 완료 화면 출력
+                print("=" * 60)
+                print("🎉 타이머 완료!")
+                print("=" * 60)
+                print(f"설정된 시간 {self.COLORS['GREEN']}{self.COLORS['BOLD']}{self.format_time(total_seconds)}{self.COLORS['RESET']}이 모두 경과했습니다.")
+                if task_description:
+                    print(f"완료한 업무: {self.COLORS['CYAN']}{self.COLORS['BOLD']}{task_description}{self.COLORS['RESET']}")
+                print("=" * 60)
+                sys.stdout.flush()
+                
+                # 완료 알림음 재생
+                sound_file = self._voice_path("타이머종료.mp3")
+                print("🔊 완료 알림음을 재생합니다...")
+                sys.stdout.flush()
+                self.play_sound(sound_file)
+                
+                # 완료 직후 리마인더를 먼저 시작하여, 사용자가 응답하지 않아도 3분 후 알림이 울리도록 함
+                self.start_reminder_thread()
+                
+                # 완료 후 성공 여부 확인 및 보상 타이머 처리
+                task_success = None
+                reward_executed = False
+                try:
+                    while True:
+                        answer = input("\n업무를 성공적으로 완료했나요? (y/n): ").strip().lower()
+                        if answer in ('y', 'n'):
+                            task_success = (answer == 'y')
+                            break
+                        print("y 또는 n만 입력해주세요!")
+                except KeyboardInterrupt:
+                    task_success = False
+                    print("\n입력이 취소되어 미완료로 처리합니다.")
+                
+                # 보상 타이머 실행 조건: 성공 + 보상 설정됨
+                if task_success and reward_info and isinstance(reward_info, dict) and reward_info.get('seconds', 0) > 0:
+                    # 보상 중에는 리마인더가 겹치지 않도록 일시 중지
+                    self.stop_reminder_thread()
+                    reward_seconds = int(reward_info.get('seconds', 0))
+                    reward_desc = reward_info.get('description', '')
+                    print("\n" + "=" * 60)
+                    print("🎁 보상 타이머를 시작합니다.")
+                    if reward_desc:
+                        print(f"보상: {self.COLORS['CYAN']}{self.COLORS['BOLD']}{reward_desc}{self.COLORS['RESET']}")
+                    print(f"보상 시간: {self.COLORS['GREEN']}{self.COLORS['BOLD']}{self.format_time(reward_seconds)}{self.COLORS['RESET']}")
+                    print("=" * 60)
+                    # 보상 타이머 실행
+                    reward_executed = self.run_reward_timer(reward_seconds, reward_desc, log_number)
+                    # 보상 종료 후 리마인더 재시작
+                    self.start_reminder_thread()
+                
+                # 로그 업데이트
+                if log_number:
+                    self.log_timer_complete(log_number, task_success=task_success, reward_executed=reward_executed)
+                # 리마인더는 완료 직후 이미 시작됨. (보상 실행 시에는 위에서 재시작)
+                
+        except KeyboardInterrupt:
+            self.is_running = False
+            # 터미널 설정 복원 (출력이 정상적으로 보이도록)
+            try:
+                if self.old_settings and sys.platform != 'win32':
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+                    self.old_settings = None
+            except (termios.error, OSError):
+                pass
+            
+            # 출력 버퍼 비우기
+            sys.stdout.flush()
+            time.sleep(0.1)  # 터미널 설정 복원 후 짧은 대기
+            
+            self.clear_screen()
+            sys.stdout.flush()
+            
+            print("=" * 60)
+            print("⏹️ 타이머가 중지되었습니다.")
+            print(f"남은 시간: {self.COLORS['GREEN']}{self.COLORS['BOLD']}{self.format_time(remaining_seconds)}{self.COLORS['RESET']}")
+            if task_description:
+                print(f"진행 중이던 업무: {self.COLORS['CYAN']}{self.COLORS['BOLD']}{task_description}{self.COLORS['RESET']}")
+            print("=" * 60)
+            sys.stdout.flush()
+            
+            # 로그 업데이트
+            if log_number:
+                self.log_timer_stop(log_number, remaining_seconds)
+        
+        finally:
+            # 터미널 설정 복원
+            try:
+                if self.old_settings and sys.platform != 'win32':
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+                    self.old_settings = None
+            except (termios.error, OSError):
+                pass
+    
+    def get_user_input(self):
+        """사용자로부터 업무, 시간, (선택)보상 정보를 입력받습니다."""
+        # 사용자가 타이머를 설정하기 시작하면 알림 중지
+        self.stop_reminder_thread()
+        
+        # 먼저 업무 텍스트 입력 받기 (필수)
+        print("=" * 60)
+        print("⏰ 트레이닝 타이머")
+        print("=" * 60)
+        print("📋 이 시간 동안 할 업무를 입력해주세요:")
+        print("=" * 60)
+        print("(업무 입력은 필수입니다)")
+        print("=" * 60)
+        
+        task_description = ""
+        while True:
+            try:
+                task_description = input("\n업무 입력: ").strip()
+                
+                if not task_description:
+                    print("⚠️  업무를 입력하지 않으면 타이머를 시작할 수 없습니다!")
+                    print("업무를 입력해주세요.")
+                    continue
+                
+                self.current_task = task_description
+                break
+                
+            except KeyboardInterrupt:
+                print("\n프로그램을 종료합니다.")
+                sys.exit(0)
+        
+        # 시간 선택
+        print("\n" + "=" * 60)
+        print("⏰ 시간을 선택해주세요:")
+        print("=" * 60)
+        print("단축키:")
+        print("  1️⃣  30분") 
+        print("  2️⃣  20분")
+        print("  3️⃣  15분")
+        print("  4️⃣  10분")
+        print("  5️⃣  5분")
+        print("  6️⃣  직접입력")
+        print()
+        print("=" * 60)
+        
+        total_seconds = None
+        while True:
+            try:
+                user_input = input("선택 (1-6): ").strip()
+                
+                if not user_input:
+                    print("번호를 입력해주세요!")
+                    continue
+                
+                # 단축키 처리
+                if user_input == "1":
+                    total_seconds = 30 * 60  # 30분
+                    break
+                elif user_input == "2":
+                    total_seconds = 20 * 60  # 20분
+                    break
+                elif user_input == "3":
+                    total_seconds = 15 * 60  # 15분
+                    break
+                elif user_input == "4":
+                    total_seconds = 10 * 60  # 10분
+                    break
+                elif user_input == "5":
+                    total_seconds = 5 * 60  # 5분
+                    break
+                elif user_input == "6":
+                    total_seconds = self.get_custom_input()
+                    break
+                else:
+                    print("1-6 중에서 선택해주세요!")
+                    continue
+                
+            except KeyboardInterrupt:
+                print("\n프로그램을 종료합니다.")
+                sys.exit(0)
+        
+        # 보상 설정 입력 (선택)
+        print("\n" + "=" * 60)
+        print("🎁 보상 설정 (선택 사항)")
+        print("=" * 60)
+        print("업무를 성공적으로 완료했을 때 실행할 보상을 설정할 수 있습니다.")
+        print("설정하지 않으려면 Enter를 눌러 건너뛰세요.")
+        reward_info = None
+        try:
+            # 보상 설명 먼저 입력(빈 값이면 건너뜀)
+            reward_desc = input("\n보상 설명을 입력하세요 (선택, Enter 건너뛰기): ").strip()
+            if reward_desc:
+                # 보상 시간 선택(단축키 + 직접입력)
+                print("\n" + "=" * 60)
+                print("⏰ 보상 시간을 선택해주세요:")
+                print("=" * 60)
+                print("단축키:")
+                print("  1️⃣  30분") 
+                print("  2️⃣  20분")
+                print("  3️⃣  15분")
+                print("  4️⃣  10분")
+                print("  5️⃣  5분")
+                print("  6️⃣  직접입력")
+                print()
+                print("=" * 60)
+                
+                reward_seconds = None
+                while True:
+                    try:
+                        sel = input("선택 (1-6): ").strip()
+                        if not sel:
+                            print("번호를 입력해주세요!")
+                            continue
+                        if sel == "1":
+                            reward_seconds = 30 * 60
+                            break
+                        elif sel == "2":
+                            reward_seconds = 20 * 60
+                            break
+                        elif sel == "3":
+                            reward_seconds = 15 * 60
+                            break
+                        elif sel == "4":
+                            reward_seconds = 10 * 60
+                            break
+                        elif sel == "5":
+                            reward_seconds = 5 * 60
+                            break
+                        elif sel == "6":
+                            reward_seconds = self.get_custom_input()
+                            break
+                        else:
+                            print("1-6 중에서 선택해주세요!")
+                            continue
+                    except KeyboardInterrupt:
+                        print("\n보상 시간 입력을 취소했습니다.")
+                        reward_seconds = None
+                        break
+                
+                if reward_seconds and reward_seconds > 0:
+                    reward_info = {
+                        'description': reward_desc,
+                        'seconds': reward_seconds
+                    }
+        except KeyboardInterrupt:
+            print("\n보상 설정을 건너뜁니다.")
+            reward_info = None
+        
+        return total_seconds, task_description, reward_info
+    
+    def get_custom_input(self):
+        """직접 시간 입력을 받습니다."""
+        print("\n" + "=" * 60)
+        print("⏰ 직접 시간 입력")
+        print("=" * 60)
+        print("시간을 입력해주세요:")
+        print("예시:")
+        print("  - 5분: 5m 또는 300")
+        print("  - 1시간 30분: 1h30m 또는 5400")
+        print("  - 2시간: 2h 또는 7200")
+        print("  - 30초: 30s 또는 30")
+        print("=" * 60)
+        
+        while True:
+            try:
+                user_input = input("시간 입력: ").strip().lower()
+                
+                if not user_input:
+                    print("시간을 입력해주세요!")
+                    continue
+                
+                # 시간 파싱
+                total_seconds = self.parse_time_input(user_input)
+                
+                if total_seconds <= 0:
+                    print("0보다 큰 시간을 입력해주세요!")
+                    continue
+                
+                return total_seconds
+                
+            except ValueError:
+                print("올바른 시간 형식을 입력해주세요!")
+            except KeyboardInterrupt:
+                print("\n프로그램을 종료합니다.")
+                sys.exit(0)
+    
+    def parse_time_input(self, time_str):
+        """시간 문자열을 초로 변환합니다."""
+        # 숫자만 입력된 경우 (초로 간주)
+        if time_str.isdigit():
+            return int(time_str)
+        
+        total_seconds = 0
+        
+        # 시간 단위 파싱
+        if 'h' in time_str:
+            parts = time_str.split('h')
+            if len(parts) == 2:
+                hours = int(parts[0]) if parts[0] else 0
+                total_seconds += hours * 3600
+                time_str = parts[1]
+        
+        if 'm' in time_str:
+            parts = time_str.split('m')
+            if len(parts) == 2:
+                minutes = int(parts[0]) if parts[0] else 0
+                total_seconds += minutes * 60
+                time_str = parts[1]
+        
+        if 's' in time_str:
+            parts = time_str.split('s')
+            if len(parts) == 2:
+                seconds = int(parts[0]) if parts[0] else 0
+                total_seconds += seconds
+                time_str = parts[1]
+        
+        # 남은 숫자가 있으면 초로 추가
+        if time_str.strip().isdigit():
+            total_seconds += int(time_str.strip())
+        
+        return total_seconds
+
+def main():
+    """메인 함수"""
+    timer = TerminalTimer()
+    
+    try:
+        while True:
+            # 사용자 입력 받기 (시간과 업무)
+            total_seconds, task_description, reward_info = timer.get_user_input()
+            
+            # 타이머 시작 로그 기록
+            log_number = timer.log_timer_start(total_seconds, task_description, reward_info)
+            
+            # 타이머 시작
+            print(f"\n타이머를 {timer.format_time(total_seconds)}로 설정했습니다.")
+            if task_description:
+                print(f"업무: {task_description}")
+            print(f"📝 로그 번호: {log_number}")
+            print("3초 후 시작됩니다...")
+            
+            for i in range(3, 0, -1):
+                print(f"{i}...")
+                timer.play_beep()  # 비프음 재생
+                time.sleep(1)
+            
+            # 카운트다운 실행
+            timer.countdown(total_seconds, task_description, log_number, reward_info)
+            
+            # 타이머 완료 후 다시 시작할지 물어보기
+            print("\n" + "=" * 60)
+            print("다시 타이머를 시작하시겠습니까?")
+            print("=" * 60)
+            print("  Enter: 다시 시작")
+            print("  Ctrl+C: 프로그램 종료")
+            print("=" * 60)
+            
+            # 잠시 대기 (사용자가 Enter를 누르거나 Ctrl+C를 누를 수 있도록)
+            try:
+                input("\n계속하려면 Enter를 누르세요...")
+            except KeyboardInterrupt:
+                print("\n프로그램을 종료합니다.")
+                sys.exit(0)
+            
+            # 화면을 지우고 다시 시작
+            timer.clear_screen()
+        
+    except KeyboardInterrupt:
+        print("\n프로그램을 종료합니다.")
+        sys.exit(0)
+    except Exception as e:
+        print(f"오류가 발생했습니다: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
